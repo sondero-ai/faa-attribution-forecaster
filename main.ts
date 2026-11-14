@@ -28,6 +28,10 @@ export interface ModelOptions {
   shrink: number;
   medianZero: boolean;
   medianShrink: number;
+  medianWindow: number;
+  medianPerMarket: boolean;
+  sigmaFloor: number;
+  tailWiden: number;
   sumPullRho: number;
 }
 
@@ -43,7 +47,11 @@ const DEFAULTS: ModelOptions = {
   priceBuckets: true,
   shrink: 0.75,
   medianZero: false,
-  medianShrink: 0.5,
+  medianShrink: 0.75,
+  medianWindow: 0,
+  medianPerMarket: false,
+  sigmaFloor: 0.25,
+  tailWiden: 1.1,
   sumPullRho: 0.99,
 };
 
@@ -157,6 +165,62 @@ function buildFan(c: CaseFile, series: number[][], opts: ModelOptions): number[]
   return fan;
 }
 
+/** Median drift fan: pooled standardized h-step changes over a shorter recent window. */
+function buildMedianFan(c: CaseFile, series: number[][], opts: ModelOptions): number[][] {
+  const buckets: number[][] = Array.from({ length: opts.fanBuckets }, () => []);
+  const H = c.horizon_minutes;
+  for (let mi = 0; mi < c.markets.length; mi++) {
+    const prices = c.markets[mi].prices;
+    const sig = series[mi];
+    const n = prices.length;
+    const from = Math.max(1, n - opts.medianWindow);
+    for (let h = 1; h <= H; h++) {
+      const bucket = Math.min(opts.fanBuckets - 1, Math.floor(((h - 1) * opts.fanBuckets) / H));
+      const rootH = Math.sqrt(h);
+      for (let t = from; t < n - h; t += opts.fanStride) {
+        const denom = sig[t] * rootH;
+        if (!(denom > 1e-12)) continue;
+        let r = (prices[t + h] - prices[t]) / denom;
+        if (!Number.isFinite(r)) continue;
+        if (r > opts.fanCap) r = opts.fanCap;
+        else if (r < -opts.fanCap) r = -opts.fanCap;
+        buckets[bucket].push(r);
+      }
+    }
+  }
+  for (const arr of buckets) arr.sort((a, b) => a - b);
+  return buckets;
+}
+
+/** Per-market median drift: each market's own standardized h-step changes. */
+function buildPerMarketMedian(c: CaseFile, series: number[][], opts: ModelOptions): number[][][] {
+  const out: number[][][] = [];
+  const H = c.horizon_minutes;
+  for (let mi = 0; mi < c.markets.length; mi++) {
+    const buckets: number[][] = Array.from({ length: opts.fanBuckets }, () => []);
+    const prices = c.markets[mi].prices;
+    const sig = series[mi];
+    const n = prices.length;
+    const from = Math.max(1, n - (opts.medianWindow || opts.fanWindow));
+    for (let h = 1; h <= H; h++) {
+      const bucket = Math.min(opts.fanBuckets - 1, Math.floor(((h - 1) * opts.fanBuckets) / H));
+      const rootH = Math.sqrt(h);
+      for (let t = from; t < n - h; t += opts.fanStride) {
+        const denom = sig[t] * rootH;
+        if (!(denom > 1e-12)) continue;
+        let r = (prices[t + h] - prices[t]) / denom;
+        if (!Number.isFinite(r)) continue;
+        if (r > opts.fanCap) r = opts.fanCap;
+        else if (r < -opts.fanCap) r = -opts.fanCap;
+        buckets[bucket].push(r);
+      }
+    }
+    for (const arr of buckets) arr.sort((a, b) => a - b);
+    out.push(buckets);
+  }
+  return out;
+}
+
 /** Forecasts every market of one case. */
 export function forecastCase(c: CaseFile, options: Partial<ModelOptions> = {}): { forecasts: ForecastRow[] } {
   const opts: ModelOptions = { ...DEFAULTS, ...options };
@@ -164,6 +228,8 @@ export function forecastCase(c: CaseFile, options: Partial<ModelOptions> = {}): 
   const pbCount = opts.priceBuckets ? PRICE_BUCKET_COUNT : 0;
   const series = c.markets.map((m) => sigmaSeries(m.prices, opts.halfLife));
   const fan = buildFan(c, series, opts);
+  const medianFan = opts.medianWindow > 0 ? buildMedianFan(c, series, opts) : null;
+  const perMarketMedian = opts.medianPerMarket ? buildPerMarketMedian(c, series, opts) : null;
 
   const positiveSigmas: number[] = [];
   for (const s of series) {
@@ -176,10 +242,9 @@ export function forecastCase(c: CaseFile, options: Partial<ModelOptions> = {}): 
   const lasts = c.markets.map((m) => lastFinite(m.prices, 0.5));
   const sum0 = lasts.reduce((a, b) => a + b, 0);
   const nMarkets = c.markets.length;
-  const pull = sum0 > 1e-9 && (
-    (nMarkets >= 8 && sum0 >= 0.5 && sum0 <= 1.5) ||
-    (sum0 >= 0.85 && sum0 <= 1.15)
-  );
+  // Only an exhaustive-looking family (many markets summing to ~1) is pulled to 1;
+  // a four-market low-probability family must not be.
+  const pull = sum0 > 1e-9 && nMarkets >= 8 && sum0 >= 0.5 && sum0 <= 1.5;
 
   const forecasts: ForecastRow[] = [];
   for (let mi = 0; mi < c.markets.length; mi++) {
@@ -187,7 +252,15 @@ export function forecastCase(c: CaseFile, options: Partial<ModelOptions> = {}): 
     const n = prices.length;
     const x = lasts[mi];
     const sigLast = series[mi][n - 1];
-    const sigma = Number.isFinite(sigLast) && sigLast > 0 ? sigLast : fallbackSigma;
+    const sigLongVals: number[] = [];
+    for (let i = Math.max(0, n - opts.fanWindow); i < n; i++) {
+      const v = series[mi][i];
+      if (Number.isFinite(v) && v > 0) sigLongVals.push(v);
+    }
+    sigLongVals.sort((a, b) => a - b);
+    const sigLong = sigLongVals.length ? sigLongVals[Math.floor(sigLongVals.length / 2)] : 0;
+    const sigma0 = Number.isFinite(sigLast) && sigLast > 0 ? sigLast : fallbackSigma;
+    const sigma = Math.max(sigma0, opts.sigmaFloor * sigLong);
     const pb = opts.priceBuckets ? priceBucket(x) : 0;
     const rows: number[][] = [];
     for (let h = 1; h <= H; h++) {
@@ -205,8 +278,16 @@ export function forecastCase(c: CaseFile, options: Partial<ModelOptions> = {}): 
         }
         if (j === 2) {
           if (opts.medianZero) z = 0;
-          else if (arr.length >= opts.fanMinN) z = opts.medianShrink * quantileSorted(arr, QUANTILES[2]);
+          else if (perMarketMedian && perMarketMedian[mi][bucket].length >= opts.fanMinN) {
+            z = opts.medianShrink * quantileSorted(perMarketMedian[mi][bucket], QUANTILES[2]);
+          }
+          else if (medianFan && medianFan[bucket].length >= opts.fanMinN) {
+            z = opts.medianShrink * quantileSorted(medianFan[bucket], QUANTILES[2]);
+          } else if (arr.length >= opts.fanMinN) {
+            z = opts.medianShrink * quantileSorted(arr, QUANTILES[2]);
+          }
         }
+        if (opts.tailWiden !== 1 && (j === 0 || j === 4)) z *= opts.tailWiden;
         let q = x + z * denom;
         if (pull) {
           const sh = 1 + (sum0 - 1) * Math.pow(opts.sumPullRho, h);
